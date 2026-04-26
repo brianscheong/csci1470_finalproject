@@ -1,0 +1,4 @@
+Model: N/A
+Num subjects: 100
+Mean Dice: 0.538844
+Std Dice: 0.105588

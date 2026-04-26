@@ -1,0 +1,4 @@
+Model: weights/kits_vxm_4_20.h5
+Num subjects: 100
+Mean Dice: 0.609652
+Std Dice: 0.122631
