@@ -17,8 +17,11 @@ import json
 lr = 1e-4 # PAPER
 steps_per_epoch = 500
 max_epochs = 50
+
+# ABLATION TEST 1: VARY REULARIZATION PARAMETER LAMBDA
 ncc_weight = 1.0
-grad_weight = 1.0 # chatGPT suggested 0.01, but papers suggests 1 is optimal if using NCC loss (fig 7)
+grad_weight = 1.0
+
 int_steps = 7 # num steps of integrating velocity field to getr deformation field
 int_downsize = 2 # downsample velocity field before integration for time/memory
 val_steps = 50
@@ -98,8 +101,9 @@ model = vxm.networks.VxmDense( # initialize weights (Keras default. Basically ju
     int_downsize=int_downsize # downsampling factor for integration.
 )
 
+# ABLATION TEST 2: CHANGE LOSS TO SSIM
 losses = [
-    vxm.losses.NCC().loss, # similarity loss [-1,1]
+    vxm.losses.NCC().loss, # similarity loss
     vxm.losses.Grad('l2').loss # regularity loss
 ]
 
