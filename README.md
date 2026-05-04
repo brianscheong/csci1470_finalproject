@@ -12,6 +12,10 @@ This project critically evaluates [VoxelMorph](https://github.com/voxelmorph/vox
 
 ---
 
+![Final Poster](final_poster.jpg)
+
+---
+
 ## Repository layout
 
 ```
