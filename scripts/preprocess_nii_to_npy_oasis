@@ -1,0 +1,37 @@
+import os
+import glob
+import numpy as np
+import nibabel as nib
+
+# =========================================
+# Part two of OASIS preprocessing.
+# Converts preprocessed .nii.gz files → .npy for faster loading during training.
+# Run after preprocess_oasis.py.
+# =========================================
+
+in_dir  = "/oscar/scratch/bcheong/csci1470_data/oasis/dataset_preproc"
+out_dir = "/oscar/scratch/bcheong/csci1470_data/oasis/dataset_preproc_npy"
+
+subj_dirs = sorted(glob.glob(os.path.join(in_dir, "OAS1_*")))
+print(f"Found {len(subj_dirs)} subjects")
+
+for subj_dir in subj_dirs:
+    sid = os.path.basename(subj_dir)
+    out_subj = os.path.join(out_dir, sid)
+    os.makedirs(out_subj, exist_ok=True)
+
+    # --- brain image ---
+    img_path = os.path.join(subj_dir, "brain.nii.gz")
+    if os.path.exists(img_path):
+        img = nib.load(img_path).get_fdata().astype(np.float32)
+        np.save(os.path.join(out_subj, "brain.npy"), img)
+
+    # --- segmentation ---
+    seg_path = os.path.join(subj_dir, "aparc+aseg.nii.gz")
+    if os.path.exists(seg_path):
+        seg = nib.load(seg_path).get_fdata().astype(np.int32)
+        np.save(os.path.join(out_subj, "aparc+aseg.npy"), seg)
+
+    print(f"Saved {sid}")
+
+print("Done.")

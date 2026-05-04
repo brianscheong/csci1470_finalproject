@@ -1,0 +1,150 @@
+#!/usr/bin/env python
+import os
+import json
+import glob
+import argparse
+import numpy as np
+import voxelmorph as vxm
+import tensorflow as tf
+
+# =========================================
+# Evaluates a trained VoxelMorph model on the OASIS test set.
+# Samples random pairs, warps the moving segmentation using the predicted
+# deformation field, and reports mean Dice score.
+#
+# Usage:
+#   python test_oasis.py --model weights/oasis_vxm_default_best.h5 \
+#                        --out results/dice_oasis_default.txt \
+#                        --num_pairs 100
+#
+# For the no-warp baseline (negative control), pass --model none
+# =========================================
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--model",     default="none",
+                    help="Path to .h5 model, or 'none' for no-warp baseline")
+parser.add_argument("--num_pairs", type=int, default=100,
+                    help="Number of random test pairs to evaluate")
+parser.add_argument("--seed",      type=int, default=0)
+args = parser.parse_args()
+
+# ------- Paths -------
+DATA_DIR   = "/oscar/scratch/bcheong/csci1470_data/oasis/dataset_preproc_npy"
+SPLIT_PATH = "/oscar/home/bcheong/science/csci1470_finalproject/oasis_split.json"
+
+target_shape = (160, 192, 224)
+np.random.seed(args.seed)
+
+# ------- Load split -------
+with open(SPLIT_PATH) as f:
+    split = json.load(f)
+
+all_ids = {os.path.basename(d)
+           for d in glob.glob(os.path.join(DATA_DIR, "OAS1_*"))}
+
+test_cases = [sid for sid in split["test"] if sid in all_ids]
+print(f"Test subjects: {len(test_cases)}")
+
+# ------- Load model -------
+use_warp = args.model.lower() != "none"
+if use_warp:
+    print(f"Loading model: {args.model}")
+    model = vxm.networks.VxmDense.load(args.model)
+else:
+    print("No-warp baseline (negative control)")
+    model = None
+
+# ------- Label warping layer -------
+label_transform = vxm.networks.Transform(
+    target_shape,
+    nb_feats=1,
+    interp_method="nearest",  # preserve discrete label values
+)
+
+# ------- Helper functions -------
+def load_img(sid):
+    path = os.path.join(DATA_DIR, sid, "brain.npy")
+    vol  = np.load(path).astype(np.float32)
+    return vol[np.newaxis, ..., np.newaxis]   # (1, D, H, W, 1)
+
+def load_seg(sid):
+    path = os.path.join(DATA_DIR, sid, "aparc+aseg.npy")
+    seg  = np.load(path).astype(np.float32)
+    return seg[np.newaxis, ..., np.newaxis]   # (1, D, H, W, 1)
+
+def dice(seg1, seg2):
+    """Binary Dice (any nonzero label vs background)."""
+    a = (seg1 > 0).astype(bool)
+    b = (seg2 > 0).astype(bool)
+    denom = a.sum() + b.sum()
+    if denom == 0:
+        return 1.0
+    return 2.0 * np.logical_and(a, b).sum() / denom
+
+def multiclass_dice(seg1, seg2, labels=None):
+    """
+    Mean Dice across foreground labels present in either segmentation.
+    Falls back to binary Dice if labels list is not provided.
+    """
+    if labels is None:
+        return dice(seg1, seg2)
+    scores = []
+    for lbl in labels:
+        a = (seg1 == lbl)
+        b = (seg2 == lbl)
+        denom = a.sum() + b.sum()
+        if denom == 0:
+            continue
+        scores.append(2.0 * np.logical_and(a, b).sum() / denom)
+    return float(np.mean(scores)) if scores else 0.0
+
+# FreeSurfer aparc+aseg labels present in OASIS (subset used by VoxelMorph paper)
+BRAIN_LABELS = [
+    2, 3, 4, 5, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+    24, 26, 28, 31, 41, 42, 43, 44, 46, 47, 49, 50, 51, 52,
+    53, 54, 58, 60, 63, 77, 1002, 1003, 1005, 1006, 1007, 1008,
+    1009, 1010, 1011, 1012, 1013, 1014, 1015, 1016, 1017, 1018,
+    1019, 1020, 1021, 1022, 1023, 1024, 1025, 1026, 1027, 1028,
+    1029, 1030, 1031, 1034, 1035, 2002, 2003, 2005, 2006, 2007,
+    2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017,
+    2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026, 2027,
+    2028, 2029, 2030, 2031, 2034, 2035,
+]
+
+# ------- Evaluation loop -------
+dice_scores = []
+
+for k in range(args.num_pairs):
+    sid_m, sid_f = np.random.choice(test_cases, size=2, replace=False)
+
+    moving_img = load_img(sid_m)
+    fixed_img  = load_img(sid_f)
+    moving_seg = load_seg(sid_m)
+    fixed_seg  = load_seg(sid_f)
+
+    if use_warp:
+        # Forward pass: predict deformation field
+        warped_img, warp_field = model.predict([moving_img, fixed_img], verbose=0)
+        # Warp the segmentation using the same deformation field
+        warped_seg = label_transform.predict([moving_seg, warp_field], verbose=0)
+    else:
+        # No-warp baseline: use moving_seg unmodified
+        warped_seg = moving_seg
+
+    d = multiclass_dice(warped_seg.squeeze(), fixed_seg.squeeze(), labels=BRAIN_LABELS)
+    dice_scores.append(d)
+
+    print(
+        f"Pair {k+1:>3}: {sid_m} → {sid_f} | "
+        f"Dice = {d:.4f} | "
+        f"Running mean = {np.mean(dice_scores):.4f}"
+    )
+
+mean_dice = np.mean(dice_scores)
+std_dice  = np.std(dice_scores)
+
+print("------------------------------------------------")
+print(f"Mean Dice: {mean_dice:.4f}")
+print(f"Std  Dice: {std_dice:.4f}")
+
+

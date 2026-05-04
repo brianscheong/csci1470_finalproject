@@ -1,110 +1,189 @@
 #!/usr/bin/env python
 import os
+import json
 import glob
+import argparse
 import numpy as np
 import voxelmorph as vxm
 import tensorflow as tf
-import json
 
 # =========================================
-# This script computes the average Dice score of warped kidney segmentations (via random pairs sampled from test set)), using any VoxelMorph model (customize in LOAD MODEL).
-
-# IMPORTANT: LOAD MODEL and SAVE RESULTS sections should be configured
+# Evaluates a trained VoxelMorph model on the KiTS23 test set.
+# Samples random pairs, warps the moving segmentation using the predicted
+# deformation field, and reports mean Dice score.
+#
+# Usage:
+#   python test_kits.py --model weights/kits_vxm_best.h5 \
+#                       --out results/dice_kits_trained.txt \
+#                       --num_pairs 100
+#
+# For the no-warp baseline, pass --model none
+# For the classical baseline, pass --model classical
 # =========================================
 
-# ---------------- CONFIG ----------------
-data_dir = "/oscar/scratch/bcheong/csci1470_data/kits23/dataset_preproc_npy"
+parser = argparse.ArgumentParser()
+parser.add_argument("--model",     default="weights/kits_vxm_best.h5",
+                    help="Path to .h5 model, 'none' for no-warp, or 'classical' for ANTs")
+parser.add_argument("--num_pairs", type=int, default=100,
+                    help="Number of random test pairs to evaluate")
+parser.add_argument("--seed",      type=int, default=0)
+args = parser.parse_args()
+
+# ------- Paths -------
+DATA_DIR   = "/oscar/scratch/bcheong/csci1470_data/kits23/dataset_preproc_npy"
+SPLIT_PATH = "/oscar/home/bcheong/science/csci1470_finalproject/kits_split.json"
+
 target_shape = (160, 192, 224)
-np.random.seed(0)
+np.random.seed(args.seed)
 
-# -------- LOAD MODEL (configure as needed) --------
-# model_path = "weights/vxm_dense_brain_T1_3D_mse.h5" # pretrained on composite brain MRI set (see Vxm paper). This script is conducting a negative control.
-model = vxm.networks.VxmDense( # random weights. true negative control.
-    inshape=(160, 192, 224),
-    src_feats=1,
-    trg_feats=1,
-    unet_half_res=True,
-    int_steps=7,
-    int_downsize=2
-)
-model_path = "N/A"
-# model_path = "weights/kits_vxm_4_20.h5" # trained on KiTS but with improved training scheme--more images per epoch and validation to avoid overfitting (early stopped at ~25/50 epochs). 
-# model = vxm.networks.VxmDense.load(model_path)
-
-# -------- FUNCTIONS --------
-def load_vol(case_id, is_label=False):
-    case_dir = os.path.join(data_dir, case_id)
-
-    if is_label:
-        vol = np.load(os.path.join(case_dir, "segmentation.npy"))
-    else:
-        vol = np.load(os.path.join(case_dir, "imaging.npy")).astype(np.float32)
-
-    vol = vol[np.newaxis, ..., np.newaxis]
-    return vol
-
-def dice(seg1, seg2):
-    seg1 = (seg1 > 0)
-    seg2 = (seg2 > 0)
-    if seg1.sum() + seg2.sum() == 0:
-        return 1.0
-    return 2 * np.logical_and(seg1, seg2).sum() / (seg1.sum() + seg2.sum())
-
-# -------- build case list --------
-case_dirs = sorted(glob.glob(os.path.join(data_dir, "case_*")))
-case_ids = [os.path.basename(c) for c in case_dirs]
-
-# -------- load split from JSON --------
-split_path = "/oscar/home/bcheong/science/csci1470_finalproject/kits_split.json"
-
-with open(split_path, "r") as f:
+# ------- Load split -------
+with open(SPLIT_PATH) as f:
     split = json.load(f)
 
-train_cases = [cid for cid in split["train"] if cid in case_ids]
-val_cases   = [cid for cid in split["val"]   if cid in case_ids]
-test_cases  = [cid for cid in split["test"]  if cid in case_ids]
+all_ids = {os.path.basename(d)
+           for d in glob.glob(os.path.join(DATA_DIR, "case_*"))}
 
-print(f"Train: {len(train_cases)}, Val: {len(val_cases)}, Test: {len(test_cases)}")
-print(load_vol(test_cases[0]).shape)
+test_cases = [cid for cid in split["test"] if cid in all_ids]
+print(f"Test cases: {len(test_cases)}")
 
-# -------- label warping layer --------
+# ------- Load model -------
+mode = args.model.lower()
+if mode == "none":
+    print("Mode: no-warp baseline (negative control)")
+    model = None
+elif mode == "classical":
+    print("Mode: classical registration (SimpleITK affine)")
+    model = "classical"
+else:
+    print(f"Mode: VoxelMorph — loading {args.model}")
+    model = vxm.networks.VxmDense.load(args.model)
+
+# ------- Label warping layer -------
 label_transform = vxm.networks.Transform(
-    target_shape, nb_feats=1, interp_method="nearest" # nearest neighbor interpolation to preserve discrete labels. Default is linear which would give us non-integer values for the warped segmentation, which don't make sense as class labels..
+    target_shape,
+    nb_feats=1,
+    interp_method="nearest",
 )
 
-# -------- MAIN LOOP  --------
-num_pairs = 100 # or 200 if you want more stable stats
+# ------- Helper functions -------
+def load_vol(cid, is_label=False):
+    case_dir = os.path.join(DATA_DIR, cid)
+    fname    = "segmentation.npy" if is_label else "imaging.npy"
+    vol      = np.load(os.path.join(case_dir, fname))
+    dtype    = np.float32
+    vol      = vol.astype(dtype)
+    return vol[np.newaxis, ..., np.newaxis]  # (1, D, H, W, 1)
 
+def dice(seg1, seg2):
+    """Binary Dice: any nonzero label vs background."""
+    a = (seg1 > 0).astype(bool)
+    b = (seg2 > 0).astype(bool)
+    denom = a.sum() + b.sum()
+    if denom == 0:
+        return 1.0
+    return 2.0 * np.logical_and(a, b).sum() / denom
+
+def classical_register_and_dice(moving_img_np, fixed_img_np,
+                                 moving_seg_np, fixed_seg_np):
+    """
+    Run SimpleITK affine registration between a moving/fixed pair
+    and return the Dice score of the warped moving segmentation.
+    """
+    import SimpleITK as sitk
+
+    def to_sitk_img(arr):
+        img = sitk.GetImageFromArray(arr.astype(np.float32))
+        img.SetSpacing((1.0, 1.0, 1.0))
+        return img
+
+    def to_sitk_seg(arr):
+        img = sitk.GetImageFromArray(arr.astype(np.uint8))
+        img.SetSpacing((1.0, 1.0, 1.0))
+        return img
+
+    moving_sitk = to_sitk_img(moving_img_np)
+    fixed_sitk  = to_sitk_img(fixed_img_np)
+
+    # Initialise affine transform at geometry centre
+    tx = sitk.CenteredTransformInitializer(
+        fixed_sitk, moving_sitk,
+        sitk.AffineTransform(3),
+        sitk.CenteredTransformInitializerFilter.GEOMETRY,
+    )
+
+    reg = sitk.ImageRegistrationMethod()
+    reg.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
+    reg.SetMetricSamplingStrategy(reg.RANDOM)
+    reg.SetMetricSamplingPercentage(0.1)
+    reg.SetInterpolator(sitk.sitkLinear)
+    reg.SetOptimizerAsGradientDescent(learningRate=1.0, numberOfIterations=100)
+    reg.SetOptimizerScalesFromPhysicalShift()
+    reg.SetInitialTransform(tx, inPlace=False)
+
+    final_tx = reg.Execute(fixed_sitk, moving_sitk)
+
+    # Warp segmentation with nearest-neighbour interpolation
+    warped_seg_sitk = sitk.Resample(
+        to_sitk_seg(moving_seg_np),
+        fixed_sitk,
+        final_tx,
+        sitk.sitkNearestNeighbor,
+        0,
+        sitk.sitkUInt8,
+    )
+    warped_seg_np = sitk.GetArrayFromImage(warped_seg_sitk).astype(np.float32)
+
+    return dice(warped_seg_np, fixed_seg_np)
+
+# ------- Evaluation loop -------
+import time
 dice_scores = []
+times       = []
 
-for k in range(num_pairs):
-    case_i, case_j = np.random.choice(test_cases, size=2, replace=False) # sample random pair from test set without replacement
+for k in range(args.num_pairs):
+    cid_m, cid_f = np.random.choice(test_cases, size=2, replace=False)
 
-    moving_img = load_vol(case_i, is_label=False)
-    fixed_img  = load_vol(case_j, is_label=False)
+    moving_img = load_vol(cid_m, is_label=False)
+    fixed_img  = load_vol(cid_f, is_label=False)
+    moving_seg = load_vol(cid_m, is_label=True)
+    fixed_seg  = load_vol(cid_f, is_label=True)
 
-    moving_lab = load_vol(case_i, is_label=True)
-    fixed_lab  = load_vol(case_j, is_label=True)
+    t0 = time.time()
 
-    d = dice(moving_lab.squeeze(), fixed_lab.squeeze()) # to test no-warp case (negative control)
+    if model is None:
+        # No-warp baseline
+        warped_seg = moving_seg
+        d = dice(warped_seg.squeeze(), fixed_seg.squeeze())
 
+    elif model == "classical":
+        d = classical_register_and_dice(
+            moving_img.squeeze(), fixed_img.squeeze(),
+            moving_seg.squeeze(), fixed_seg.squeeze(),
+        )
+
+    else:
+        # VoxelMorph
+        _, warp_field = model.predict([moving_img, fixed_img], verbose=0)
+        warped_seg    = label_transform.predict([moving_seg, warp_field], verbose=0)
+        d = dice(warped_seg.squeeze(), fixed_seg.squeeze())
+
+    elapsed = time.time() - t0
     dice_scores.append(d)
+    times.append(elapsed)
 
     print(
-        f"Pair {k+1}: {case_i} -> {case_j} | "
-        f"Dice = {d:.4f} | "
+        f"Pair {k+1:>3}: {cid_m} → {cid_f} | "
+        f"Dice = {d:.4f} | time = {elapsed:.1f}s | "
         f"Running mean = {np.mean(dice_scores):.4f}"
     )
 
-print("------------------------------------------------")
-print(f"Mean Dice: {np.mean(dice_scores):.4f}")
-print(f"Std Dice:  {np.std(dice_scores):.4f}")
+mean_dice  = np.mean(dice_scores)
+std_dice   = np.std(dice_scores)
+total_time = np.sum(times)
 
-# -------- save results to text file (CONFIGURE AS NEEDED)--------
-os.makedirs("results", exist_ok=True)
-out_path = os.path.join("results", "dice_results_kits_4_20_no_warp.txt")
-with open(out_path, "w") as f:
-    f.write(f"Model: {model_path}\n")
-    f.write(f"Num subjects: {len(dice_scores)}\n")
-    f.write(f"Mean Dice: {np.mean(dice_scores):.6f}\n")
-    f.write(f"Std Dice: {np.std(dice_scores):.6f}\n")
+print("------------------------------------------------")
+print(f"Mean Dice : {mean_dice:.4f}")
+print(f"Std  Dice : {std_dice:.4f}")
+print(f"Total time: {total_time:.1f}s over {args.num_pairs} pairs")
+
+
